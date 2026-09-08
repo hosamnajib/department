@@ -23,11 +23,33 @@ const DEFAULT_DEPARTMENTS = [
 ];
 
 // Initialize App
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  const ready = await ensureAuth();
+  if (!ready) return; // redirecting to the gateway sign-in page
   loadData();
   populateDropdowns();
   renderCurrentTab();
 });
+
+// Gateway sign-in bootstrap (MICROAPP_AUTH.md).
+// The gateway is the only place anyone signs in; if we have no live session,
+// send the browser there. Fails open to local/offline mode if /auth/me is
+// unreachable, or when the URL carries ?local=1.
+async function ensureAuth() {
+  if (location.search.includes('local=1')) return true;
+  try {
+    const res = await fetch('/auth/me', { credentials: 'same-origin', cache: 'no-store' });
+    if (!res.ok) return true;
+    const data = await res.json();
+    if (data && data.authenticated === false) {
+      window.location.replace('/auth/login');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    return true;
+  }
+}
 
 // Data Persistence (MySQL API with localStorage fallback)
 async function loadData() {
