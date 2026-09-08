@@ -13,7 +13,7 @@ const GATEWAY_URL = process.env.GATEWAY_URL || 'http://127.0.0.1:4301';
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://127.0.0.1:${PORT}`;
 const CORRELATION_HEADER = 'x-correlation-id';
 
-// Public paths per SS-8 and Microapp Auth specification
+// SS-8 Public Paths - the only paths that answer without a token
 const PUBLIC_PATHS = new Set([
   '/health',
   '/openapi.json',
@@ -92,7 +92,7 @@ async function verifyToken(token, expectedUse) {
   return claims;
 }
 
-// SS-4 Correlation ID & SS-5 Error Envelope Helper
+// SS-4 Correlation ID & Header Setup
 app.use((req, res, next) => {
   const incomingCid = req.headers[CORRELATION_HEADER];
   req.cid = typeof incomingCid === 'string' && incomingCid.trim() ? incomingCid.trim() : randomUUID();
@@ -115,6 +115,71 @@ function sendError(res, cid, status, code, message, details = null) {
 
 app.use(cors());
 app.use(express.json());
+
+// Route Matcher Helper
+function matchRoutePath(pathname) {
+  const cleanPath = pathname.replace(/\/+$/, '') || '/';
+  if (openapiSpec.paths[cleanPath]) return cleanPath;
+  if (/^\/api\/departments\/[^/]+$/.test(cleanPath)) return '/api/departments/{id}';
+  if (/^\/api\/supervisors\/[^/]+$/.test(cleanPath)) return '/api/supervisors/{id}';
+  return null;
+}
+
+// Method Not Allowed (405) & Authentication (401/403) Enforcement Middleware
+app.use(async (req, res, next) => {
+  const pathname = req.path.replace(/\/+$/, '') || '/';
+  const routeKey = matchRoutePath(pathname);
+
+  // Check 405 Method Not Allowed on defined OpenAPI paths BEFORE Auth (SS-5)
+  if (routeKey) {
+    const allowedMethods = Object.keys(openapiSpec.paths[routeKey] || {}).map((m) => m.toUpperCase());
+    if (!allowedMethods.includes(req.method.toUpperCase())) {
+      res.setHeader('allow', allowedMethods.join(', '));
+      return sendError(res, req.cid, 405, 'METHOD_NOT_ALLOWED', `${req.method} is not allowed on ${pathname}.`);
+    }
+  }
+
+  // Check 404 for unrouted API endpoints (SS-5)
+  if (pathname.startsWith('/api/') && !routeKey) {
+    return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No route for ${pathname}.`);
+  }
+
+  // Authentication check for non-public paths (SS-6, SS-8, SS-25)
+  if (!PUBLIC_PATHS.has(pathname)) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return sendError(res, req.cid, 401, 'UNAUTHORIZED', 'A bearer token is required.');
+    }
+
+    const match = /^Bearer\s+(\S+)$/i.exec(authHeader);
+    if (!match) {
+      return sendError(res, req.cid, 401, 'UNAUTHORIZED', 'A bearer token is required.');
+    }
+
+    try {
+      const claims = await verifyToken(match[1], 'access');
+      req.userClaims = claims;
+
+      // Scope Check (SS-6)
+      const methodKey = req.method.toLowerCase();
+      const reqSecurity = openapiSpec.paths[routeKey]?.[methodKey]?.security || [];
+      const requiredScopes = reqSecurity.flatMap((reqObj) => Object.values(reqObj)).flat();
+      const grantedScopes = new Set(String(claims.scope || '').split(/\s+/).filter(Boolean));
+      const missingScopes = requiredScopes.filter((sc) => !grantedScopes.has(sc));
+
+      if (missingScopes.length > 0) {
+        return sendError(res, req.cid, 403, 'FORBIDDEN', `This endpoint needs ${missingScopes.join(', ')}.`, {
+          required: requiredScopes,
+          granted: [...grantedScopes]
+        });
+      }
+    } catch (err) {
+      return sendError(res, req.cid, 401, 'UNAUTHORIZED', String(err.message || err));
+    }
+  }
+
+  next();
+});
 
 // Serve Static Frontend Files
 app.use(express.static(__dirname, {
@@ -183,65 +248,6 @@ app.get('/auth/callback', async (req, res) => {
 app.get('/auth/me', (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
   return res.json({ status: 'ok', service: SERVICE_ID });
-});
-
-// Route Matcher Helper
-function matchRoutePath(pathname) {
-  if (openapiSpec.paths[pathname]) return pathname;
-  if (/^\/api\/departments\/[^/]+$/.test(pathname)) return '/api/departments/{id}';
-  if (/^\/api\/supervisors\/[^/]+$/.test(pathname)) return '/api/supervisors/{id}';
-  return null;
-}
-
-// SS-5 & SS-6 Middleware: Handle Method Not Allowed (405) and Authentication (401/403)
-app.use('/api/*', async (req, res, next) => {
-  const urlPath = req.baseUrl;
-  const routeSpecKey = matchRoutePath(urlPath);
-  const method = req.method.toLowerCase();
-
-  // SS-5: Unrouted API Path -> 404 Error Envelope
-  if (!routeSpecKey) {
-    return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No route for ${req.baseUrl}.`);
-  }
-
-  const allowedMethods = Object.keys(openapiSpec.paths[routeSpecKey] || {}).map((m) => m.toUpperCase());
-
-  // SS-5: Wrong Method -> 405 Error Envelope + Allow Header
-  if (!allowedMethods.includes(req.method.toUpperCase())) {
-    res.setHeader('allow', allowedMethods.join(', '));
-    return sendError(res, req.cid, 405, 'METHOD_NOT_ALLOWED', `${req.method} is not allowed on ${req.baseUrl}.`);
-  }
-
-  // SS-6 Security Check: If Authorization header is provided or required
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    const match = /^Bearer\s+(\S+)$/i.exec(authHeader);
-    if (!match) {
-      return sendError(res, req.cid, 401, 'UNAUTHORIZED', 'A valid Bearer token is required.');
-    }
-
-    try {
-      const claims = await verifyToken(match[1], 'access');
-      req.userClaims = claims;
-
-      // Scope Check
-      const reqSecurity = openapiSpec.paths[routeSpecKey][method]?.security || [];
-      const requiredScopes = reqSecurity.flatMap((reqObj) => Object.values(reqObj)).flat();
-      const grantedScopes = new Set(String(claims.scope || '').split(/\s+/).filter(Boolean));
-      const missingScopes = requiredScopes.filter((sc) => !grantedScopes.has(sc));
-
-      if (missingScopes.length > 0) {
-        return sendError(res, req.cid, 403, 'FORBIDDEN', `Missing required scope: ${missingScopes.join(', ')}.`, {
-          required: requiredScopes,
-          granted: [...grantedScopes]
-        });
-      }
-    } catch (err) {
-      return sendError(res, req.cid, 401, 'UNAUTHORIZED', String(err.message || err));
-    }
-  }
-
-  next();
 });
 
 // --- DEPARTMENT API ENDPOINTS ---

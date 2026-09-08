@@ -82,12 +82,34 @@ const openapiSpec = {
   paths: {
     "/health": {
       get: {
-        summary: "Liveness and dependency check endpoint"
+        summary: "Liveness and dependency check endpoint",
+        "x-rizurf": {
+          name: "Health Check",
+          purpose: "Check service health and status",
+          use_when: ["Checking liveness", "Monitoring service health"],
+          do_not_use_when: [],
+          inputs: [],
+          outputs: ["status", "service", "version", "uptime_seconds", "checks"],
+          requires: [],
+          related_endpoints: ["GET /openapi.json"],
+          tags: ["health", "status", "liveness"]
+        }
       }
     },
     "/openapi.json": {
       get: {
-        summary: "OpenAPI 3.0 specification document"
+        summary: "OpenAPI 3.0 specification document",
+        "x-rizurf": {
+          name: "OpenAPI Specification",
+          purpose: "Retrieve OpenAPI specification document",
+          use_when: ["Catalog discovery", "Gateway conformance checks"],
+          do_not_use_when: [],
+          inputs: [],
+          outputs: ["openapi", "info", "paths", "components"],
+          requires: [],
+          related_endpoints: ["GET /health"],
+          tags: ["openapi", "spec", "documentation"]
+        }
       }
     },
     "/api/departments": {
