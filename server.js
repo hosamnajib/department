@@ -134,9 +134,23 @@ function matchRoutePath(pathname) {
   return null;
 }
 
+// Normalize pathname: treat /., //, or any root-variant as '/'
+function normalizePath(raw) {
+  // Strip trailing slashes, then normalize root-like paths
+  let p = raw.replace(/\/+$/, '') || '/';
+  // /. /.. /./  => treat as root
+  if (p === '/.' || p === '/..' || p === '') p = '/';
+  return p;
+}
+
+// Check if path looks like a static asset (has a file extension)
+function isStaticAsset(pathname) {
+  return /\.\w{1,6}$/.test(pathname);
+}
+
 // Method Not Allowed (405), Unrouted (404), & Authentication (401/403) Enforcement Middleware
 app.use(async (req, res, next) => {
-  const pathname = req.path.replace(/\/+$/, '') || '/';
+  const pathname = normalizePath(req.path);
   const routeKey = matchRoutePath(pathname);
 
   // 1. Check 405 Method Not Allowed on defined OpenAPI paths BEFORE Auth (SS-5)
@@ -148,8 +162,8 @@ app.use(async (req, res, next) => {
     }
   }
 
-  // 2. Unrouted path check (SS-5): Any unrouted API or non-static path returns 404
-  if (!routeKey && !PUBLIC_PATHS.has(pathname) && !pathname.startsWith('/auth/')) {
+  // 2. Pass through if: it's a public API path, an auth path, or a static file (has extension)
+  if (!routeKey && !PUBLIC_PATHS.has(pathname) && !pathname.startsWith('/auth/') && !isStaticAsset(pathname)) {
     return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No route for ${pathname}.`);
   }
 
