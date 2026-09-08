@@ -116,6 +116,15 @@ function sendError(res, cid, status, code, message, details = null) {
 app.use(cors());
 app.use(express.json());
 
+// Serve Static Frontend Files first
+app.use(express.static(__dirname, {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    }
+  }
+}));
+
 // Route Matcher Helper
 function matchRoutePath(pathname) {
   const cleanPath = pathname.replace(/\/+$/, '') || '/';
@@ -139,7 +148,7 @@ app.use(async (req, res, next) => {
     }
   }
 
-  // 2. Unrouted path check (SS-5): Any path not in OpenAPI spec and not a static public asset returns 404
+  // 2. Unrouted path check (SS-5): Any unrouted API or non-static path returns 404
   if (!routeKey && !PUBLIC_PATHS.has(pathname) && !pathname.startsWith('/auth/')) {
     return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No route for ${pathname}.`);
   }
@@ -180,15 +189,6 @@ app.use(async (req, res, next) => {
 
   next();
 });
-
-// Serve Static Frontend Files
-app.use(express.static(__dirname, {
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.html')) {
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-    }
-  }
-}));
 
 // SS-2: Health Check Endpoint
 app.get('/health', async (req, res) => {
