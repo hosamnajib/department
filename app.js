@@ -26,10 +26,35 @@ const DEFAULT_DEPARTMENTS = [
 document.addEventListener('DOMContentLoaded', async () => {
   const ready = await ensureAuth();
   if (!ready) return; // redirecting to the gateway sign-in page
-  loadData();
+  await loadData();
   populateDropdowns();
   renderCurrentTab();
 });
+
+// Send a write to the API. Unlike bare fetch(), this rejects on a non-2xx
+// response and surfaces the server's error message, so callers never treat a
+// failed save as success.
+async function apiSend(url, method, body) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin'
+  });
+  if (res.status === 401) {
+    window.location.replace('/auth/login');
+    throw new Error('Session expired — signing in again.');
+  }
+  if (!res.ok) {
+    let message = `Request failed (${res.status}).`;
+    try {
+      const data = await res.json();
+      if (data && data.error && data.error.message) message = data.error.message;
+    } catch (_) { /* non-JSON body */ }
+    throw new Error(message);
+  }
+  return res.status === 204 ? null : res.json().catch(() => null);
+}
 
 // Gateway sign-in bootstrap (MICROAPP_AUTH.md).
 // The gateway is the only place anyone signs in; if we have no live session,
@@ -55,20 +80,28 @@ async function ensureAuth() {
 async function loadData() {
   try {
     const [deptsRes, supsRes] = await Promise.all([
-      fetch('/api/departments'),
-      fetch('/api/supervisors')
+      fetch('/api/departments', { credentials: 'same-origin' }),
+      fetch('/api/supervisors', { credentials: 'same-origin' })
     ]);
 
+    if (deptsRes.status === 401 || supsRes.status === 401) {
+      window.location.replace('/auth/login');
+      return;
+    }
+
     if (deptsRes.ok && supsRes.ok) {
-      departments = await deptsRes.json();
-      supervisors = await supsRes.json();
+      const depts = await deptsRes.json();
+      const sups = await supsRes.json();
+      departments = Array.isArray(depts) ? depts : [];
+      supervisors = Array.isArray(sups) ? sups : [];
       saveDataLocal();
       populateDropdowns();
       renderCurrentTab();
       return;
     }
+    console.warn(`API load failed (departments ${deptsRes.status}, supervisors ${supsRes.status}). Using local copy.`);
   } catch (e) {
-    console.warn('MySQL API server unavailable or unconfigured. Falling back to local storage.');
+    console.warn('API unreachable. Falling back to local storage.');
   }
 
   // Fallback to localStorage
@@ -79,6 +112,8 @@ async function loadData() {
   supervisors = savedSups ? JSON.parse(savedSups) : [...DEFAULT_SUPERVISORS];
 
   saveDataLocal();
+  populateDropdowns();
+  renderCurrentTab();
 }
 
 function saveDataLocal() {
@@ -160,7 +195,7 @@ function switchTab(tabName) {
 
 // Helper: Get Supervisor Object by ID
 function getSupervisorById(id) {
-  return supervisors.find(s => s.id === id) || { firstName: 'Unassigned', lastName: '', email: 'N/A' };
+  return supervisors.find(s => s.id === id) || { id: '—', firstName: 'Unassigned', lastName: '', email: 'N/A' };
 }
 
 // Render Logic
@@ -182,12 +217,12 @@ function renderDepartments(searchQuery, supervisorFilter, statusFilter) {
 
   let filtered = departments.filter(dept => {
     const sup = getSupervisorById(dept.supervisorId);
-    const supName = `${sup.firstName} ${sup.lastName}`.toLowerCase();
+    const supName = `${sup.firstName || ''} ${sup.lastName || ''}`.toLowerCase();
 
     // Search query match
-    const matchesSearch = !searchQuery || 
-      dept.id.toLowerCase().includes(searchQuery) ||
-      dept.name.toLowerCase().includes(searchQuery) ||
+    const matchesSearch = !searchQuery ||
+      String(dept.id || '').toLowerCase().includes(searchQuery) ||
+      String(dept.name || '').toLowerCase().includes(searchQuery) ||
       supName.includes(searchQuery);
 
     // Supervisor filter match
@@ -268,22 +303,24 @@ function renderSupervisors(searchQuery, deptFilter, statusFilter) {
   tbody.innerHTML = '';
 
   let filtered = supervisors.filter(sup => {
-    const fullName = `${sup.firstName} ${sup.lastName}`.toLowerCase();
+    const fullName = `${sup.firstName || ''} ${sup.lastName || ''}`.toLowerCase();
 
     const matchesSearch = !searchQuery ||
-      sup.id.toLowerCase().includes(searchQuery) ||
+      String(sup.id || '').toLowerCase().includes(searchQuery) ||
       fullName.includes(searchQuery) ||
-      sup.email.toLowerCase().includes(searchQuery);
+      String(sup.email || '').toLowerCase().includes(searchQuery);
 
     const matchesStatus = statusFilter === 'all' || sup.status === statusFilter;
 
     return matchesSearch && matchesStatus;
   });
 
-  // Sort
+  // Sort. The supervisors table has no "name" column, so a sort picked on the
+  // departments tab maps to firstName here instead of silently doing nothing.
+  const sortKey = sortState.key === 'name' ? 'firstName' : sortState.key;
   filtered.sort((a, b) => {
-    let valA = a[sortState.key] || '';
-    let valB = b[sortState.key] || '';
+    let valA = a[sortKey] || '';
+    let valB = b[sortKey] || '';
     if (typeof valA === 'string') valA = valA.toLowerCase();
     if (typeof valB === 'string') valB = valB.toLowerCase();
 
@@ -402,41 +439,19 @@ async function saveDepartment(e) {
   const supervisorId = document.getElementById('dept-supervisor').value;
   const status = document.getElementById('dept-status').value;
 
-  const payload = { id, name, supervisorId, status };
-
   try {
     if (mode === 'add') {
-      if (!id || departments.some(d => d.id === id)) {
-        payload.id = generateNextDeptId();
-      }
-      await fetch('/api/departments', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      if (!id || departments.some(d => d.id === id)) id = generateNextDeptId();
+      await apiSend('/api/departments', 'POST', { id, name, supervisorId, status });
     } else {
-      payload.id = oldId;
-      await fetch(`/api/departments/${encodeURIComponent(oldId)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      await apiSend(`/api/departments/${encodeURIComponent(oldId)}`, 'PUT', { id: oldId, name, supervisorId, status });
     }
   } catch (err) {
-    console.warn('API save failed, saving to local state:', err);
+    alert('Could not save department: ' + err.message);
+    return; // leave the modal open so the user can correct and retry
   }
 
-  // Update local memory & UI
-  if (mode === 'add') {
-    departments.push(payload);
-  } else {
-    const idx = departments.findIndex(d => d.id === oldId);
-    if (idx !== -1) departments[idx] = payload;
-  }
-
-  saveDataLocal();
-  populateDropdowns();
-  renderCurrentTab();
+  await loadData(); // re-sync from the database, the source of truth
   closeModal('department-modal');
 }
 
@@ -470,40 +485,19 @@ async function saveSupervisor(e) {
   const email = document.getElementById('sup-email').value.trim();
   const status = document.getElementById('sup-status').value;
 
-  const payload = { id, firstName, lastName, email, status };
-
   try {
     if (mode === 'add') {
-      if (!id || supervisors.some(s => s.id === id)) {
-        payload.id = generateNextSupId();
-      }
-      await fetch('/api/supervisors', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      if (!id || supervisors.some(s => s.id === id)) id = generateNextSupId();
+      await apiSend('/api/supervisors', 'POST', { id, firstName, lastName, email, status });
     } else {
-      payload.id = oldId;
-      await fetch(`/api/supervisors/${encodeURIComponent(oldId)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      await apiSend(`/api/supervisors/${encodeURIComponent(oldId)}`, 'PUT', { id: oldId, firstName, lastName, email, status });
     }
   } catch (err) {
-    console.warn('API save failed, saving to local state:', err);
+    alert('Could not save supervisor: ' + err.message);
+    return; // leave the modal open so the user can correct and retry
   }
 
-  if (mode === 'add') {
-    supervisors.push(payload);
-  } else {
-    const idx = supervisors.findIndex(s => s.id === oldId);
-    if (idx !== -1) supervisors[idx] = payload;
-  }
-
-  saveDataLocal();
-  populateDropdowns();
-  renderCurrentTab();
+  await loadData(); // re-sync from the database, the source of truth
   closeModal('supervisor-modal');
 }
 
@@ -547,24 +541,17 @@ async function executeDelete() {
   if (!recordToDelete) return;
 
   const { type, id } = recordToDelete;
+  recordToDelete = null;
 
   try {
     const endpoint = type === 'department' ? '/api/departments/' : '/api/supervisors/';
-    await fetch(endpoint + encodeURIComponent(id), { method: 'DELETE' });
+    await apiSend(endpoint + encodeURIComponent(id), 'DELETE');
   } catch (err) {
-    console.warn('API delete failed, updating local state:', err);
+    alert('Could not delete ' + type + ': ' + err.message);
+    return;
   }
 
-  if (type === 'department') {
-    departments = departments.filter(d => d.id !== id);
-  } else {
-    supervisors = supervisors.filter(s => s.id !== id);
-  }
-
-  saveDataLocal();
-  populateDropdowns();
-  renderCurrentTab();
-  recordToDelete = null;
+  await loadData(); // re-sync from the database, the source of truth
 }
 
 // Utility: Escape HTML
