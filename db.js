@@ -63,6 +63,13 @@ const dbName = fromUrl.database || process.env.DB_NAME || 'department_db';
 let pool = null;
 let isConnected = false;
 let lastError = null;
+let lastInitAt = 0;
+let initInFlight = null;
+
+// True when the deployment is configured to use a real database. When it is,
+// the API must fail loudly (503) instead of silently serving in-memory seed
+// data if the connection is down.
+const DB_EXPECTED = Boolean(CONNECTION_STRING || process.env.DB_HOST || process.env.DB_URL);
 
 const SUPERVISORS_TABLE = `
   CREATE TABLE IF NOT EXISTS supervisors (
@@ -101,6 +108,7 @@ const DEPARTMENTS_TABLE_NO_FK = `
 `;
 
 async function initDatabase() {
+  lastInitAt = Date.now();
   console.log(`DB target ${dbConfig.host}:${dbConfig.port} db=${dbName} ssl=${Boolean(dbConfig.ssl)} source=${CONNECTION_STRING ? 'connection-string' : 'DB_* vars'}`);
 
   try {
@@ -189,9 +197,42 @@ function getDbError() {
   return lastError;
 }
 
+function dbExpected() {
+  return DB_EXPECTED;
+}
+
+// Called when a live query reveals the pooled connection is actually dead, so
+// the next ensureDb() rebuilds it instead of trusting a stale isConnected flag.
+function markDbDown() {
+  isConnected = false;
+  pool = null;
+}
+
+// Reconnect on demand. A serverless instance that lost the race to the DB at
+// cold start would otherwise serve the in-memory fallback for its whole life;
+// this retries (debounced, and de-duped while an attempt is in flight).
+async function ensureDb() {
+  if (isConnected && pool) return true;
+  if (initInFlight) {
+    await initInFlight;
+    return isConnected;
+  }
+  if (Date.now() - lastInitAt < 4000) return false;
+  initInFlight = initDatabase()
+    .catch(() => null)
+    .finally(() => {
+      initInFlight = null;
+    });
+  await initInFlight;
+  return isConnected;
+}
+
 module.exports = {
   initDatabase,
+  ensureDb,
+  markDbDown,
   getPool,
   isDbConnected,
-  getDbError
+  getDbError,
+  dbExpected
 };

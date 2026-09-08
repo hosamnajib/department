@@ -11,7 +11,7 @@ const {
 } = require('node:crypto');
 require('dotenv').config();
 
-const { initDatabase, getPool, isDbConnected, getDbError } = require('./db');
+const { ensureDb, markDbDown, getPool, isDbConnected, getDbError, dbExpected } = require('./db');
 const { SERVICE_ID, VERSION, openapiSpec } = require('./openapiSpec');
 
 const app = express();
@@ -442,6 +442,36 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// API data-layer gate: never cache, ensure a live DB, fail loud if it's down
+// ---------------------------------------------------------------------------
+
+app.use('/api', async (req, res, next) => {
+  res.setHeader('cache-control', 'no-store');
+  try {
+    await ensureDb();
+    if (isDbConnected()) {
+      await getPool().query('SELECT 1'); // prove the pooled connection is alive
+    }
+  } catch (err) {
+    markDbDown();
+    try { await ensureDb(); } catch (_) { /* stays down */ }
+  }
+
+  // With a real DB configured, a down connection must not fall through to the
+  // in-memory seed data — that is what showed stale departments on refresh.
+  if (!isDbConnected() && dbExpected()) {
+    return sendError(
+      res,
+      req.cid,
+      503,
+      'SERVICE_UNAVAILABLE',
+      'The database is temporarily unavailable. Please retry in a moment.'
+    );
+  }
+  next();
+});
+
+// ---------------------------------------------------------------------------
 // DEPARTMENT API
 // ---------------------------------------------------------------------------
 
@@ -669,7 +699,7 @@ app.use((req, res) => {
 
 // Kick off the DB connection attempt regardless of how the module is loaded
 // (a serverless host requires this file, it does not run it as main).
-const dbReady = initDatabase().catch(() => null);
+const dbReady = ensureDb().catch(() => null);
 
 if (require.main === module) {
   dbReady.then(() => {

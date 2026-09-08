@@ -77,11 +77,11 @@ async function ensureAuth() {
 }
 
 // Data Persistence (MySQL API with localStorage fallback)
-async function loadData() {
+async function loadData(attempt = 0) {
   try {
     const [deptsRes, supsRes] = await Promise.all([
-      fetch('/api/departments', { credentials: 'same-origin' }),
-      fetch('/api/supervisors', { credentials: 'same-origin' })
+      fetch('/api/departments', { credentials: 'same-origin', cache: 'no-store' }),
+      fetch('/api/supervisors', { credentials: 'same-origin', cache: 'no-store' })
     ]);
 
     if (deptsRes.status === 401 || supsRes.status === 401) {
@@ -99,12 +99,24 @@ async function loadData() {
       renderCurrentTab();
       return;
     }
-    console.warn(`API load failed (departments ${deptsRes.status}, supervisors ${supsRes.status}). Using local copy.`);
+
+    // 503 etc. — the DB is briefly unavailable. Retry before falling back, and
+    // do NOT overwrite what's on screen with seed data.
+    if ((deptsRes.status >= 500 || supsRes.status >= 500) && attempt < 3) {
+      await new Promise(r => setTimeout(r, 700 * (attempt + 1)));
+      return loadData(attempt + 1);
+    }
+    console.warn(`API load failed (departments ${deptsRes.status}, supervisors ${supsRes.status}).`);
+    if (attempt === 0 && (deptsRes.status >= 500 || supsRes.status >= 500)) {
+      alert('The server could not reach the database. Showing the last loaded data — refresh in a moment.');
+    }
+    if (departments.length || supervisors.length) return; // keep current data
   } catch (e) {
-    console.warn('API unreachable. Falling back to local storage.');
+    console.warn('API unreachable:', e);
+    if (departments.length || supervisors.length) return;
   }
 
-  // Fallback to localStorage
+  // First load with nothing to show: fall back to localStorage / defaults.
   const savedDepts = localStorage.getItem('dept_app_departments');
   const savedSups = localStorage.getItem('dept_app_supervisors');
 
