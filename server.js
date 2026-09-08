@@ -11,7 +11,7 @@ const {
 } = require('node:crypto');
 require('dotenv').config();
 
-const { initDatabase, getPool, isDbConnected } = require('./db');
+const { initDatabase, getPool, isDbConnected, getDbError } = require('./db');
 const { SERVICE_ID, VERSION, openapiSpec } = require('./openapiSpec');
 
 const app = express();
@@ -251,13 +251,16 @@ app.use((req, res, next) => {
 
 app.get('/health', (req, res) => {
   res.setHeader('content-type', 'application/json');
-  return res.status(200).json({
+  const body = {
     status: 'ok',
     service: SERVICE_ID,
     version: VERSION,
     uptime_seconds: Math.floor(process.uptime()),
     checks: { database: isDbConnected() }
-  });
+  };
+  const dbErr = getDbError();
+  if (!isDbConnected() && dbErr) body.db_diagnostic = dbErr;
+  return res.status(200).json(body);
 });
 
 app.get('/openapi.json', (req, res) => {

@@ -62,6 +62,7 @@ const dbName = fromUrl.database || process.env.DB_NAME || 'department_db';
 
 let pool = null;
 let isConnected = false;
+let lastError = null;
 
 const SUPERVISORS_TABLE = `
   CREATE TABLE IF NOT EXISTS supervisors (
@@ -157,10 +158,19 @@ async function initDatabase() {
     }
 
     isConnected = true;
+    lastError = null;
     console.log('MySQL database initialized successfully.');
     return pool;
   } catch (error) {
-    console.warn(`MySQL connection failed (${error.code || 'ERR'}: ${error.message}). Running with in-memory fallback store.`);
+    // Keep a sanitized note (code + message, no credentials) so /health can
+    // report why the DB is unreachable without needing the platform logs.
+    lastError = {
+      code: error.code || 'ERR',
+      message: String(error.message || error).replace(/:[^:@/]*@/, ':***@'),
+      target: `${dbConfig.host}:${dbConfig.port}`,
+      ssl: Boolean(dbConfig.ssl)
+    };
+    console.warn(`MySQL connection failed (${lastError.code}: ${lastError.message}). Running with in-memory fallback store.`);
     isConnected = false;
     pool = null;
     return null;
@@ -175,8 +185,13 @@ function isDbConnected() {
   return isConnected;
 }
 
+function getDbError() {
+  return lastError;
+}
+
 module.exports = {
   initDatabase,
   getPool,
-  isDbConnected
+  isDbConnected,
+  getDbError
 };
