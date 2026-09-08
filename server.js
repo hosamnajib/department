@@ -125,12 +125,12 @@ function matchRoutePath(pathname) {
   return null;
 }
 
-// Method Not Allowed (405) & Authentication (401/403) Enforcement Middleware
+// Method Not Allowed (405), Unrouted (404), & Authentication (401/403) Enforcement Middleware
 app.use(async (req, res, next) => {
   const pathname = req.path.replace(/\/+$/, '') || '/';
   const routeKey = matchRoutePath(pathname);
 
-  // Check 405 Method Not Allowed on defined OpenAPI paths BEFORE Auth (SS-5)
+  // 1. Check 405 Method Not Allowed on defined OpenAPI paths BEFORE Auth (SS-5)
   if (routeKey) {
     const allowedMethods = Object.keys(openapiSpec.paths[routeKey] || {}).map((m) => m.toUpperCase());
     if (!allowedMethods.includes(req.method.toUpperCase())) {
@@ -139,12 +139,12 @@ app.use(async (req, res, next) => {
     }
   }
 
-  // Check 404 for unrouted API endpoints (SS-5)
-  if (pathname.startsWith('/api/') && !routeKey) {
+  // 2. Unrouted path check (SS-5): Any path not in OpenAPI spec and not a static public asset returns 404
+  if (!routeKey && !PUBLIC_PATHS.has(pathname) && !pathname.startsWith('/auth/')) {
     return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No route for ${pathname}.`);
   }
 
-  // Authentication check for non-public paths (SS-6, SS-8, SS-25)
+  // 3. Authentication check for non-public paths (SS-6, SS-8, SS-25)
   if (!PUBLIC_PATHS.has(pathname)) {
     const authHeader = req.headers.authorization;
     if (!authHeader) {
