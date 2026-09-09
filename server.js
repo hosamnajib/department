@@ -11,7 +11,9 @@ const {
 } = require('node:crypto');
 require('dotenv').config();
 
-const { ensureDb, markDbDown, getPool, isDbConnected, getDbError, dbExpected } = require('./db');
+const db = require('./db');
+const schema = require('./schema');
+const repo = require('./repository');
 const { SERVICE_ID, VERSION, openapiSpec } = require('./openapiSpec');
 
 const app = express();
@@ -44,23 +46,6 @@ const PUBLIC_PATHS = new Set(['/health', '/openapi.json']);
 // Browser shell — public so the page can load before the user has signed in
 // (SS-23 note), but gated by a session in the app's own logic, not by a token.
 const BROWSER_PATHS = new Set(['/', '/index.html', '/app.js', '/styles.css', '/favicon.ico']);
-
-// In-Memory Data Store Fallback (used if MySQL DB is unreachable)
-let inMemSupervisors = [
-  { id: 'SUP-0007', firstName: 'Tauedea', lastName: 'Gabi', email: 'gabitautau@gmail.com', status: 'Active' },
-  { id: 'SUP-0008', firstName: 'Krisha', lastName: 'Lama', email: 'krilam@gmail.com', status: 'Active' },
-  { id: 'SUP-0003', firstName: 'Daniel', lastName: 'Lee', email: 'daniel.lee@example.com', status: 'Active' },
-  { id: 'SUP-0002', firstName: 'Aisyah', lastName: 'Rahman', email: 'aisyah.rahman@example.com', status: 'Active' },
-  { id: 'SUP-0001', firstName: 'Wei Jie', lastName: 'Tan', email: 'weijie.tan@example.com', status: 'Active' }
-];
-
-let inMemDepartments = [
-  { id: 'DEP-0001', name: 'Software engineering', supervisorId: 'SUP-0007', status: 'Active' },
-  { id: 'DEP-0002', name: 'Human Resources', supervisorId: 'SUP-0008', status: 'Active' },
-  { id: 'DEP-0003', name: 'Marketing', supervisorId: 'SUP-0003', status: 'Active' },
-  { id: 'DEP-0004', name: 'Business Data & Analysis', supervisorId: 'SUP-0001', status: 'Active' },
-  { id: 'DEP-0005', name: 'Product & UX Design', supervisorId: 'SUP-0002', status: 'Active' }
-];
 
 // ---------------------------------------------------------------------------
 // Token verification (SS-25 / MICROAPP_AUTH §3)
@@ -249,17 +234,26 @@ app.use((req, res, next) => {
 // Public service documents (SS-2, SS-3)
 // ---------------------------------------------------------------------------
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   res.setHeader('content-type', 'application/json');
+
+  let dbOk = false;
+  let dbDiagnostic = null;
+  try {
+    await db.ping();
+    dbOk = true;
+  } catch (err) {
+    dbDiagnostic = { code: err.code || 'ERR', message: String(err.message || err), ...db.describe() };
+  }
+
   const body = {
     status: 'ok',
     service: SERVICE_ID,
     version: VERSION,
     uptime_seconds: Math.floor(process.uptime()),
-    checks: { database: isDbConnected() }
+    checks: { database: dbOk }
   };
-  const dbErr = getDbError();
-  if (!isDbConnected() && dbErr) body.db_diagnostic = dbErr;
+  if (!dbOk) body.db_diagnostic = dbDiagnostic;
   return res.status(200).json(body);
 });
 
@@ -442,24 +436,26 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// API data-layer gate: never cache, ensure a live DB, fail loud if it's down
+// API data-layer gate: never cache; require a live, migrated database
 // ---------------------------------------------------------------------------
+
+function sendRepoError(res, cid, err) {
+  if (err && typeof err.status === 'number') {
+    return sendError(res, cid, err.status, err.code, err.message, err.details || null);
+  }
+  // SS-5 — never leak SQL or a stack trace to the caller.
+  console.error(`[${cid}] unexpected repository error:`, err && (err.code || err.message), err);
+  return sendError(res, cid, 500, 'INTERNAL_ERROR', 'Unexpected error handling the request.');
+}
 
 app.use('/api', async (req, res, next) => {
   res.setHeader('cache-control', 'no-store');
   try {
-    await ensureDb();
-    if (isDbConnected()) {
-      await getPool().query('SELECT 1'); // prove the pooled connection is alive
-    }
+    await db.ping();            // builds the pool lazily; throws if unreachable
+    await schema.ensureReady(); // idempotent, runs once per process
   } catch (err) {
-    markDbDown();
-    try { await ensureDb(); } catch (_) { /* stays down */ }
-  }
-
-  // With a real DB configured, a down connection must not fall through to the
-  // in-memory seed data — that is what showed stale departments on refresh.
-  if (!isDbConnected() && dbExpected()) {
+    await db.reset();           // drop the faulted pool; next request rebuilds it
+    console.warn(`[${req.cid}] database unavailable: ${err.code || ''} ${err.message}`);
     return sendError(
       res,
       req.cid,
@@ -472,109 +468,51 @@ app.use('/api', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// DEPARTMENT API
+// DEPARTMENT API  (SS-9..SS-12) — thin handlers over the repository
 // ---------------------------------------------------------------------------
 
 app.get('/api/departments', async (req, res) => {
   try {
-    if (isDbConnected()) {
-      const [rows] = await getPool().query('SELECT * FROM departments ORDER BY id ASC');
-      return res.status(200).json(rows);
-    }
-    return res.status(200).json(inMemDepartments);
+    return res.status(200).json(await repo.departments.list());
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.get('/api/departments/:id', async (req, res) => {
-  const { id } = req.params;
   try {
-    if (isDbConnected()) {
-      const [rows] = await getPool().query('SELECT * FROM departments WHERE id = ?', [id]);
-      if (rows.length === 0) {
-        return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${id}'.`);
-      }
-      return res.status(200).json(rows[0]);
+    const dept = await repo.departments.get(req.params.id);
+    if (!dept) {
+      return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${req.params.id}'.`);
     }
-    const dept = inMemDepartments.find((d) => d.id === id);
-    if (!dept) return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${id}'.`);
     return res.status(200).json(dept);
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.post('/api/departments', async (req, res) => {
-  const { id, name, supervisorId, status } = req.body;
-  if (!id || !name) {
-    return sendError(res, req.cid, 422, 'VALIDATION_ERROR', 'Department ID and Name are required.', {
-      fields: ['id', 'name']
-    });
-  }
   try {
-    if (isDbConnected()) {
-      await getPool().query('INSERT INTO departments (id, name, supervisorId, status) VALUES (?, ?, ?, ?)', [
-        id,
-        name,
-        supervisorId || null,
-        status || 'Active'
-      ]);
-      return res.status(201).json({ id, name, supervisorId: supervisorId || null, status: status || 'Active' });
-    }
-    if (inMemDepartments.find((d) => d.id === id)) {
-      return sendError(res, req.cid, 409, 'CONFLICT', `Department with id '${id}' already exists.`);
-    }
-    const newDept = { id, name, supervisorId: supervisorId || null, status: status || 'Active' };
-    inMemDepartments.push(newDept);
-    return res.status(201).json(newDept);
+    return res.status(201).json(await repo.departments.create(req.body || {}));
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.put('/api/departments/:id', async (req, res) => {
-  const { id } = req.params;
-  const { name, supervisorId, status } = req.body;
-  if (!name) {
-    return sendError(res, req.cid, 422, 'VALIDATION_ERROR', 'Department Name is required.', { fields: ['name'] });
-  }
   try {
-    if (isDbConnected()) {
-      const [result] = await getPool().query(
-        'UPDATE departments SET name = ?, supervisorId = ?, status = ? WHERE id = ?',
-        [name, supervisorId || null, status || 'Active', id]
-      );
-      if (result.affectedRows === 0) {
-        return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${id}'.`);
-      }
-      return res.status(200).json({ id, name, supervisorId: supervisorId || null, status: status || 'Active' });
-    }
-    const idx = inMemDepartments.findIndex((d) => d.id === id);
-    if (idx === -1) return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${id}'.`);
-    inMemDepartments[idx] = { id, name, supervisorId: supervisorId || null, status: status || 'Active' };
-    return res.status(200).json(inMemDepartments[idx]);
+    return res.status(200).json(await repo.departments.update(req.params.id, req.body || {}));
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.delete('/api/departments/:id', async (req, res) => {
-  const { id } = req.params;
   try {
-    if (isDbConnected()) {
-      const [result] = await getPool().query('DELETE FROM departments WHERE id = ?', [id]);
-      if (result.affectedRows === 0) {
-        return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${id}'.`);
-      }
-      return res.status(204).send();
-    }
-    const idx = inMemDepartments.findIndex((d) => d.id === id);
-    if (idx === -1) return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No department with id '${id}'.`);
-    inMemDepartments.splice(idx, 1);
+    await repo.departments.remove(req.params.id);
     return res.status(204).send();
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
@@ -584,107 +522,46 @@ app.delete('/api/departments/:id', async (req, res) => {
 
 app.get('/api/supervisors', async (req, res) => {
   try {
-    if (isDbConnected()) {
-      const [rows] = await getPool().query('SELECT * FROM supervisors ORDER BY id ASC');
-      return res.status(200).json(rows);
-    }
-    return res.status(200).json(inMemSupervisors);
+    return res.status(200).json(await repo.supervisors.list());
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.get('/api/supervisors/:id', async (req, res) => {
-  const { id } = req.params;
   try {
-    if (isDbConnected()) {
-      const [rows] = await getPool().query('SELECT * FROM supervisors WHERE id = ?', [id]);
-      if (rows.length === 0) {
-        return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${id}'.`);
-      }
-      return res.status(200).json(rows[0]);
+    const sup = await repo.supervisors.get(req.params.id);
+    if (!sup) {
+      return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${req.params.id}'.`);
     }
-    const sup = inMemSupervisors.find((s) => s.id === id);
-    if (!sup) return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${id}'.`);
     return res.status(200).json(sup);
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.post('/api/supervisors', async (req, res) => {
-  const { id, firstName, lastName, email, status } = req.body;
-  if (!id || !firstName || !lastName) {
-    return sendError(res, req.cid, 422, 'VALIDATION_ERROR', 'Supervisor ID, First Name, and Last Name are required.', {
-      fields: ['id', 'firstName', 'lastName']
-    });
-  }
   try {
-    if (isDbConnected()) {
-      await getPool().query('INSERT INTO supervisors (id, firstName, lastName, email, status) VALUES (?, ?, ?, ?, ?)', [
-        id,
-        firstName,
-        lastName,
-        email || '',
-        status || 'Active'
-      ]);
-      return res.status(201).json({ id, firstName, lastName, email: email || '', status: status || 'Active' });
-    }
-    if (inMemSupervisors.find((s) => s.id === id)) {
-      return sendError(res, req.cid, 409, 'CONFLICT', `Supervisor with id '${id}' already exists.`);
-    }
-    const newSup = { id, firstName, lastName, email: email || '', status: status || 'Active' };
-    inMemSupervisors.push(newSup);
-    return res.status(201).json(newSup);
+    return res.status(201).json(await repo.supervisors.create(req.body || {}));
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.put('/api/supervisors/:id', async (req, res) => {
-  const { id } = req.params;
-  const { firstName, lastName, email, status } = req.body;
-  if (!firstName || !lastName) {
-    return sendError(res, req.cid, 422, 'VALIDATION_ERROR', 'Supervisor First Name and Last Name are required.', {
-      fields: ['firstName', 'lastName']
-    });
-  }
   try {
-    if (isDbConnected()) {
-      const [result] = await getPool().query(
-        'UPDATE supervisors SET firstName = ?, lastName = ?, email = ?, status = ? WHERE id = ?',
-        [firstName, lastName, email || '', status || 'Active', id]
-      );
-      if (result.affectedRows === 0) {
-        return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${id}'.`);
-      }
-      return res.status(200).json({ id, firstName, lastName, email: email || '', status: status || 'Active' });
-    }
-    const idx = inMemSupervisors.findIndex((s) => s.id === id);
-    if (idx === -1) return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${id}'.`);
-    inMemSupervisors[idx] = { id, firstName, lastName, email: email || '', status: status || 'Active' };
-    return res.status(200).json(inMemSupervisors[idx]);
+    return res.status(200).json(await repo.supervisors.update(req.params.id, req.body || {}));
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
 app.delete('/api/supervisors/:id', async (req, res) => {
-  const { id } = req.params;
   try {
-    if (isDbConnected()) {
-      const [result] = await getPool().query('DELETE FROM supervisors WHERE id = ?', [id]);
-      if (result.affectedRows === 0) {
-        return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${id}'.`);
-      }
-      return res.status(204).send();
-    }
-    const idx = inMemSupervisors.findIndex((s) => s.id === id);
-    if (idx === -1) return sendError(res, req.cid, 404, 'RESOURCE_NOT_FOUND', `No supervisor with id '${id}'.`);
-    inMemSupervisors.splice(idx, 1);
+    await repo.supervisors.remove(req.params.id);
     return res.status(204).send();
   } catch (err) {
-    return sendError(res, req.cid, 500, 'INTERNAL_ERROR', err.message);
+    return sendRepoError(res, req.cid, err);
   }
 });
 
@@ -697,9 +574,15 @@ app.use((req, res) => {
 // Boot
 // ---------------------------------------------------------------------------
 
-// Kick off the DB connection attempt regardless of how the module is loaded
-// (a serverless host requires this file, it does not run it as main).
-const dbReady = ensureDb().catch(() => null);
+// Warm the connection + schema regardless of how the module is loaded (a
+// serverless host requires this file, it does not run it as main). A failure
+// here is not fatal — the /api gate retries on demand.
+const dbReady = db
+  .ping()
+  .then(() => schema.ensureReady())
+  .catch((err) => {
+    console.warn(`Startup database check failed (${err.code || ''} ${err.message}); will retry on demand.`);
+  });
 
 if (require.main === module) {
   dbReady.then(() => {

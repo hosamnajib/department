@@ -1,8 +1,14 @@
+// Connection layer only. No web framework, no schema, no seed data — so this
+// module is equally usable from a worker or a CLI (SS-15). Everything that
+// touches the database goes through query(), and it is parameterised only.
+
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
-// Managed hosts (and Vercel's database integrations) usually inject a single
-// connection string, not discrete DB_* vars. Accept the common names.
+// --- Configuration (SS-20): environment only. Accept a single connection
+// string (what managed hosts / platform integrations inject) or discrete
+// DB_* variables. Never inferred from a request. ---
+
 const CONNECTION_STRING =
   process.env.DATABASE_URL ||
   process.env.MYSQL_URL ||
@@ -10,7 +16,7 @@ const CONNECTION_STRING =
   process.env.DB_URL ||
   null;
 
-function parseConnectionString(str) {
+function fromConnectionString(str) {
   const u = new URL(str);
   return {
     host: decodeURIComponent(u.hostname),
@@ -18,8 +24,7 @@ function parseConnectionString(str) {
     user: decodeURIComponent(u.username || 'root'),
     password: decodeURIComponent(u.password || ''),
     database: u.pathname && u.pathname !== '/' ? decodeURIComponent(u.pathname.slice(1)) : undefined,
-    // Providers flag TLS in the query string in a few different ways.
-    sslFromUrl:
+    wantsSsl:
       u.protocol === 'mysqls:' ||
       u.searchParams.has('sslaccept') ||
       u.searchParams.get('sslmode') === 'require' ||
@@ -27,212 +32,90 @@ function parseConnectionString(str) {
   };
 }
 
-function resolveSsl(sslFromUrl) {
+function resolveSsl(wantsSsl) {
   const mode = String(process.env.DB_SSL || '').toLowerCase();
   if (['false', 'disable', 'off', '0'].includes(mode)) return undefined;
   if (['strict', 'verify'].includes(mode)) return { rejectUnauthorized: true, minVersion: 'TLSv1.2' };
-  if (['true', 'require', 'required', '1'].includes(mode) || sslFromUrl) {
-    // Encrypt in transit without pinning the provider's CA chain.
+  if (['true', 'require', 'required', '1'].includes(mode) || wantsSsl) {
     return { rejectUnauthorized: false, minVersion: 'TLSv1.2' };
   }
   return undefined;
 }
 
-let fromUrl = {};
-if (CONNECTION_STRING) {
-  try {
-    fromUrl = parseConnectionString(CONNECTION_STRING);
-  } catch (err) {
-    console.warn(`Could not parse DB connection string (${err.message}); falling back to DB_* vars.`);
-  }
-}
+const parsed = CONNECTION_STRING ? fromConnectionString(CONNECTION_STRING) : {};
 
-const dbConfig = {
-  host: fromUrl.host || process.env.DB_HOST || 'localhost',
-  port: fromUrl.port || parseInt(process.env.DB_PORT, 10) || 3306,
-  user: fromUrl.user || process.env.DB_USER || 'root',
-  password: fromUrl.password ?? (process.env.DB_PASSWORD || process.env.DB_PASS || ''),
-  connectTimeout: 10000
+const CONFIG = {
+  host: parsed.host || process.env.DB_HOST || 'localhost',
+  port: parsed.port || parseInt(process.env.DB_PORT, 10) || 3306,
+  user: parsed.user || process.env.DB_USER || 'root',
+  password: parsed.password ?? (process.env.DB_PASSWORD || process.env.DB_PASS || ''),
+  database: parsed.database || process.env.DB_NAME || 'department_db',
+  ssl: resolveSsl(parsed.wantsSsl)
 };
 
-const ssl = resolveSsl(fromUrl.sslFromUrl);
-if (ssl) dbConfig.ssl = ssl;
+// --- Pool: one per process, created lazily, rebuilt on demand after a fault.
+// A small limit keeps a fleet of serverless instances from exhausting the
+// database's own connection cap. ---
 
-const dbName = fromUrl.database || process.env.DB_NAME || 'department_db';
-
+const POOL_LIMIT = Number(process.env.DB_POOL_LIMIT || 4);
 let pool = null;
-let isConnected = false;
-let lastError = null;
-let lastInitAt = 0;
-let initInFlight = null;
-
-// True when the deployment is configured to use a real database. When it is,
-// the API must fail loudly (503) instead of silently serving in-memory seed
-// data if the connection is down.
-const DB_EXPECTED = Boolean(CONNECTION_STRING || process.env.DB_HOST || process.env.DB_URL);
-
-const SUPERVISORS_TABLE = `
-  CREATE TABLE IF NOT EXISTS supervisors (
-    id VARCHAR(20) PRIMARY KEY,
-    firstName VARCHAR(100) NOT NULL,
-    lastName VARCHAR(100) NOT NULL,
-    email VARCHAR(150) NOT NULL,
-    status VARCHAR(20) DEFAULT 'Active',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-`;
-
-const DEPARTMENTS_TABLE_FK = `
-  CREATE TABLE IF NOT EXISTS departments (
-    id VARCHAR(20) PRIMARY KEY,
-    name VARCHAR(150) NOT NULL,
-    supervisorId VARCHAR(20),
-    status VARCHAR(20) DEFAULT 'Active',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    FOREIGN KEY (supervisorId) REFERENCES supervisors(id) ON DELETE SET NULL ON UPDATE CASCADE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-`;
-
-const DEPARTMENTS_TABLE_NO_FK = `
-  CREATE TABLE IF NOT EXISTS departments (
-    id VARCHAR(20) PRIMARY KEY,
-    name VARCHAR(150) NOT NULL,
-    supervisorId VARCHAR(20),
-    status VARCHAR(20) DEFAULT 'Active',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    KEY idx_supervisor_id (supervisorId)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-`;
-
-async function initDatabase() {
-  lastInitAt = Date.now();
-  console.log(`DB target ${dbConfig.host}:${dbConfig.port} db=${dbName} ssl=${Boolean(dbConfig.ssl)} source=${CONNECTION_STRING ? 'connection-string' : 'DB_* vars'}`);
-
-  try {
-    // 1. Connect to the server. Try to create the database, but do not treat a
-    //    missing CREATE privilege (common on managed instances) as fatal.
-    const bootstrap = await mysql.createConnection(dbConfig);
-    try {
-      await bootstrap.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\`;`);
-    } catch (err) {
-      console.warn(`Skipping CREATE DATABASE (${err.message}); assuming "${dbName}" already exists.`);
-    }
-    await bootstrap.end();
-
-    // 2. Pool bound to the target database.
-    pool = mysql.createPool({
-      ...dbConfig,
-      database: dbName,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0
-    });
-
-    // 3. Tables. Fall back to a plain index if the host rejects foreign keys.
-    await pool.query(SUPERVISORS_TABLE);
-    try {
-      await pool.query(DEPARTMENTS_TABLE_FK);
-    } catch (err) {
-      console.warn(`departments foreign key not supported (${err.message}); creating without it.`);
-      await pool.query(DEPARTMENTS_TABLE_NO_FK);
-    }
-
-    // 4. Seed defaults only when empty.
-    const [supRows] = await pool.query('SELECT COUNT(*) AS count FROM supervisors');
-    if (supRows[0].count === 0) {
-      await pool.query(`
-        INSERT INTO supervisors (id, firstName, lastName, email, status) VALUES
-        ('SUP-0007', 'Tauedea', 'Gabi', 'gabitautau@gmail.com', 'Active'),
-        ('SUP-0008', 'Krisha', 'Lama', 'krilam@gmail.com', 'Active'),
-        ('SUP-0003', 'Daniel', 'Lee', 'daniel.lee@example.com', 'Active'),
-        ('SUP-0002', 'Aisyah', 'Rahman', 'aisyah.rahman@example.com', 'Active'),
-        ('SUP-0001', 'Wei Jie', 'Tan', 'weijie.tan@example.com', 'Active');
-      `);
-    }
-
-    const [deptRows] = await pool.query('SELECT COUNT(*) AS count FROM departments');
-    if (deptRows[0].count === 0) {
-      await pool.query(`
-        INSERT INTO departments (id, name, supervisorId, status) VALUES
-        ('DEP-0001', 'Software engineering', 'SUP-0007', 'Active'),
-        ('DEP-0002', 'Human Resources', 'SUP-0008', 'Active'),
-        ('DEP-0003', 'Marketing', 'SUP-0003', 'Active'),
-        ('DEP-0004', 'Business Data & Analysis', 'SUP-0001', 'Active'),
-        ('DEP-0005', 'Product & UX Design', 'SUP-0002', 'Active');
-      `);
-    }
-
-    isConnected = true;
-    lastError = null;
-    console.log('MySQL database initialized successfully.');
-    return pool;
-  } catch (error) {
-    // Keep a sanitized note (code + message, no credentials) so /health can
-    // report why the DB is unreachable without needing the platform logs.
-    lastError = {
-      code: error.code || 'ERR',
-      message: String(error.message || error).replace(/:[^:@/]*@/, ':***@'),
-      target: `${dbConfig.host}:${dbConfig.port}`,
-      ssl: Boolean(dbConfig.ssl)
-    };
-    console.warn(`MySQL connection failed (${lastError.code}: ${lastError.message}). Running with in-memory fallback store.`);
-    isConnected = false;
-    pool = null;
-    return null;
-  }
-}
 
 function getPool() {
+  if (!pool) {
+    pool = mysql.createPool({
+      host: CONFIG.host,
+      port: CONFIG.port,
+      user: CONFIG.user,
+      password: CONFIG.password,
+      database: CONFIG.database,
+      ssl: CONFIG.ssl,
+      waitForConnections: true,
+      connectionLimit: POOL_LIMIT,
+      maxIdle: POOL_LIMIT,
+      idleTimeout: 60000,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 10000,
+      connectTimeout: 10000,
+      multipleStatements: false,
+      dateStrings: true
+    });
+  }
   return pool;
 }
 
-function isDbConnected() {
-  return isConnected;
+// The single entry point for SQL. Values are always bound, never interpolated.
+async function query(sql, params = []) {
+  const [result] = await getPool().query(sql, params);
+  return result;
 }
 
-function getDbError() {
-  return lastError;
+// Cheap liveness probe. Throws if the database cannot be reached.
+async function ping() {
+  await query('SELECT 1');
 }
 
-function dbExpected() {
-  return DB_EXPECTED;
-}
-
-// Called when a live query reveals the pooled connection is actually dead, so
-// the next ensureDb() rebuilds it instead of trusting a stale isConnected flag.
-function markDbDown() {
-  isConnected = false;
+// Drop a faulted pool so the next getPool() builds a fresh one.
+async function reset() {
+  const dead = pool;
   pool = null;
-}
-
-// Reconnect on demand. A serverless instance that lost the race to the DB at
-// cold start would otherwise serve the in-memory fallback for its whole life;
-// this retries (debounced, and de-duped while an attempt is in flight).
-async function ensureDb() {
-  if (isConnected && pool) return true;
-  if (initInFlight) {
-    await initInFlight;
-    return isConnected;
+  if (dead) {
+    try {
+      await dead.end();
+    } catch {
+      /* already broken */
+    }
   }
-  if (Date.now() - lastInitAt < 4000) return false;
-  initInFlight = initDatabase()
-    .catch(() => null)
-    .finally(() => {
-      initInFlight = null;
-    });
-  await initInFlight;
-  return isConnected;
 }
 
-module.exports = {
-  initDatabase,
-  ensureDb,
-  markDbDown,
-  getPool,
-  isDbConnected,
-  getDbError,
-  dbExpected
-};
+// Non-secret summary for /health diagnostics.
+function describe() {
+  return {
+    host: CONFIG.host,
+    port: CONFIG.port,
+    database: CONFIG.database,
+    ssl: Boolean(CONFIG.ssl),
+    source: CONNECTION_STRING ? 'connection-string' : 'DB_* vars'
+  };
+}
+
+module.exports = { query, ping, reset, describe };
