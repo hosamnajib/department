@@ -58,16 +58,40 @@ function translate(err, ctx) {
 
 // --- Departments -----------------------------------------------------------
 
+// Section 8: Cache reference data briefly (30s) with instant invalidation on mutations
+const memo = new Map();
+
+async function cached(key, ttlMs, load) {
+  const hit = memo.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return hit.value;
+  const value = await load();
+  memo.set(key, { value, at: Date.now() });
+  return value;
+}
+
+function invalidate(prefix) {
+  for (const k of memo.keys()) {
+    if (k.startsWith(prefix)) memo.delete(k);
+  }
+}
+
+// --- Departments -----------------------------------------------------------
+
 const DEPT_COLS = 'id, name, supervisorId, status';
 
 const departments = {
   list() {
-    return query(`SELECT ${DEPT_COLS} FROM departments ORDER BY id ASC`);
+    return cached('departments:list', 30_000, () =>
+      query(`SELECT ${DEPT_COLS} FROM departments ORDER BY id ASC`)
+    );
   },
 
   async get(id) {
-    const rows = await query(`SELECT ${DEPT_COLS} FROM departments WHERE id = ?`, [asId(id)]);
-    return rows[0] || null;
+    const key = asId(id);
+    return cached(`departments:get:${key}`, 30_000, async () => {
+      const rows = await query(`SELECT ${DEPT_COLS} FROM departments WHERE id = ?`, [key]);
+      return rows[0] || null;
+    });
   },
 
   async create(input) {
@@ -87,6 +111,7 @@ const departments = {
     } catch (err) {
       throw translate(err, { kind: 'department', id, supervisorId });
     }
+    invalidate('departments');
     return departments.get(id);
   },
 
@@ -108,6 +133,7 @@ const departments = {
       throw translate(err, { kind: 'department', id: key, supervisorId });
     }
     if (result.affectedRows === 0) throw new NotFoundError(`No department with id '${key}'.`);
+    invalidate('departments');
     return departments.get(key);
   },
 
@@ -115,6 +141,7 @@ const departments = {
     const key = asId(id);
     const result = await query('DELETE FROM departments WHERE id = ?', [key]);
     if (result.affectedRows === 0) throw new NotFoundError(`No department with id '${key}'.`);
+    invalidate('departments');
   }
 };
 
@@ -124,12 +151,17 @@ const SUP_COLS = 'id, firstName, lastName, email, status';
 
 const supervisors = {
   list() {
-    return query(`SELECT ${SUP_COLS} FROM supervisors ORDER BY id ASC`);
+    return cached('supervisors:list', 30_000, () =>
+      query(`SELECT ${SUP_COLS} FROM supervisors ORDER BY id ASC`)
+    );
   },
 
   async get(id) {
-    const rows = await query(`SELECT ${SUP_COLS} FROM supervisors WHERE id = ?`, [asId(id)]);
-    return rows[0] || null;
+    const key = asId(id);
+    return cached(`supervisors:get:${key}`, 30_000, async () => {
+      const rows = await query(`SELECT ${SUP_COLS} FROM supervisors WHERE id = ?`, [key]);
+      return rows[0] || null;
+    });
   },
 
   async create(input) {
@@ -152,6 +184,7 @@ const supervisors = {
     } catch (err) {
       throw translate(err, { kind: 'supervisor', id });
     }
+    invalidate('supervisors');
     return supervisors.get(id);
   },
 
@@ -169,6 +202,7 @@ const supervisors = {
       [firstName, lastName, asText(input.email), asStatus(input.status), key]
     );
     if (result.affectedRows === 0) throw new NotFoundError(`No supervisor with id '${key}'.`);
+    invalidate('supervisors');
     return supervisors.get(key);
   },
 
@@ -176,6 +210,7 @@ const supervisors = {
     const key = asId(id);
     const result = await query('DELETE FROM supervisors WHERE id = ?', [key]);
     if (result.affectedRows === 0) throw new NotFoundError(`No supervisor with id '${key}'.`);
+    invalidate('supervisors');
   }
 };
 

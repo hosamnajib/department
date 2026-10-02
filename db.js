@@ -57,12 +57,12 @@ const CONFIG = {
 // A small limit keeps a fleet of serverless instances from exhausting the
 // database's own connection cap. ---
 
-const POOL_LIMIT = Number(process.env.DB_POOL_LIMIT || 4);
-let pool = null;
+const g = globalThis;
+const POOL_LIMIT = Number(process.env.DB_POOL_LIMIT || 3);
 
 function getPool() {
-  if (!pool) {
-    pool = mysql.createPool({
+  if (!g.__mysql_pool) {
+    g.__mysql_pool = mysql.createPool({
       host: CONFIG.host,
       port: CONFIG.port,
       user: CONFIG.user,
@@ -75,12 +75,12 @@ function getPool() {
       idleTimeout: 60000,
       enableKeepAlive: true,
       keepAliveInitialDelay: 10000,
-      connectTimeout: 10000,
+      connectTimeout: 4000,
       multipleStatements: false,
       dateStrings: true
     });
   }
-  return pool;
+  return g.__mysql_pool;
 }
 
 // The single entry point for SQL. Values are always bound, never interpolated.
@@ -89,15 +89,18 @@ async function query(sql, params = []) {
   return result;
 }
 
-// Cheap liveness probe. Throws if the database cannot be reached.
-async function ping() {
-  await query('SELECT 1');
+// Cheap, time-boxed liveness probe per MICROAPP_PERFORMANCE.md §3. Throws if the database cannot be reached.
+async function ping(ms = 800) {
+  await Promise.race([
+    query('SELECT 1'),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+  ]);
 }
 
 // Drop a faulted pool so the next getPool() builds a fresh one.
 async function reset() {
-  const dead = pool;
-  pool = null;
+  const dead = g.__mysql_pool;
+  g.__mysql_pool = null;
   if (dead) {
     try {
       await dead.end();

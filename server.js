@@ -16,6 +16,9 @@ const schema = require('./schema');
 const repo = require('./repository');
 const { SERVICE_ID, VERSION, openapiSpec } = require('./openapiSpec');
 
+// Section 4: Pre-serialize OpenAPI document once at module load
+const OPENAPI_JSON = JSON.stringify(openapiSpec);
+
 const app = express();
 app.set('query parser', 'simple');
 
@@ -48,18 +51,30 @@ const PUBLIC_PATHS = new Set(['/health', '/openapi.json']);
 const BROWSER_PATHS = new Set(['/', '/index.html', '/app.js', '/styles.css', '/favicon.ico']);
 
 // ---------------------------------------------------------------------------
-// Token verification (SS-25 / MICROAPP_AUTH §3)
+// Token verification (SS-25 / MICROAPP_AUTH §3 / §5c)
 // ---------------------------------------------------------------------------
 
 let jwksCache = null;
 
 async function getGatewayPublicKey(kid) {
   if (!jwksCache) {
-    const response = await fetch(`${GATEWAY_URL}/.well-known/jwks.json`);
+    const response = await fetch(`${GATEWAY_URL}/.well-known/jwks.json`, {
+      signal: AbortSignal.timeout(5000)
+    });
     if (!response.ok) throw new Error(`JWKS fetch failed with status ${response.status}`);
     jwksCache = await response.json();
   }
-  const jwk = jwksCache.keys.find((key) => key.kid === kid);
+  let jwk = jwksCache.keys?.find((key) => key.kid === kid);
+  if (!jwk) {
+    // If not found, refresh JWKS once per MICROAPP_AUTH §3
+    const response = await fetch(`${GATEWAY_URL}/.well-known/jwks.json`, {
+      signal: AbortSignal.timeout(5000)
+    });
+    if (response.ok) {
+      jwksCache = await response.json();
+      jwk = jwksCache.keys?.find((key) => key.kid === kid);
+    }
+  }
   if (!jwk) throw new Error(`No key "${kid}" in gateway JWKS.`);
   return createPublicKey({ key: jwk, format: 'jwk' });
 }
@@ -167,7 +182,8 @@ async function gatewaySessionIsLive(session) {
     const response = await fetch(`${GATEWAY_URL}/oauth/introspect`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sid: session.sid, sub: session.sub })
+      body: JSON.stringify({ sid: session.sid, sub: session.sub }),
+      signal: AbortSignal.timeout(3000)
     });
     if (!response.ok) return true; // fail open
     const { active } = await response.json();
@@ -231,7 +247,7 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Public service documents (SS-2, SS-3)
+// Public service documents (SS-2, SS-3, MICROAPP_PERFORMANCE §3, §4)
 // ---------------------------------------------------------------------------
 
 app.get('/health', async (req, res) => {
@@ -240,14 +256,14 @@ app.get('/health', async (req, res) => {
   let dbOk = false;
   let dbDiagnostic = null;
   try {
-    await db.ping();
+    await db.ping(800); // Section 3: time-box ping to 800ms
     dbOk = true;
   } catch (err) {
     dbDiagnostic = { code: err.code || 'ERR', message: String(err.message || err), ...db.describe() };
   }
 
   const body = {
-    status: 'ok',
+    status: dbOk ? 'ok' : 'degraded',
     service: SERVICE_ID,
     version: VERSION,
     uptime_seconds: Math.floor(process.uptime()),
@@ -259,7 +275,8 @@ app.get('/health', async (req, res) => {
 
 app.get('/openapi.json', (req, res) => {
   res.setHeader('content-type', 'application/json');
-  return res.status(200).json(openapiSpec);
+  res.setHeader('cache-control', 'public, max-age=60');
+  return res.status(200).send(OPENAPI_JSON);
 });
 
 // ---------------------------------------------------------------------------
@@ -283,7 +300,8 @@ app.get('/', async (req, res) => {
     const tokenRes = await fetch(`${GATEWAY_URL}/oauth/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code, redirect_uri: `${PUBLIC_URL}/` })
+      body: JSON.stringify({ code, redirect_uri: `${PUBLIC_URL}/` }),
+      signal: AbortSignal.timeout(5000)
     });
     if (!tokenRes.ok) return res.redirect('/auth/login');
 
@@ -303,11 +321,13 @@ app.get('/index.html', (req, res) => res.redirect(308, '/'));
 
 app.get('/app.js', (req, res) => {
   res.setHeader('content-type', FRONTEND['app.js'].type);
+  res.setHeader('cache-control', 'public, max-age=3600');
   return res.status(200).send(FRONTEND['app.js'].body);
 });
 
 app.get('/styles.css', (req, res) => {
   res.setHeader('content-type', FRONTEND['styles.css'].type);
+  res.setHeader('cache-control', 'public, max-age=3600');
   return res.status(200).send(FRONTEND['styles.css'].body);
 });
 
@@ -328,7 +348,8 @@ app.get('/auth/callback', async (req, res) => {
     const tokenRes = await fetch(`${GATEWAY_URL}/oauth/token`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code, redirect_uri: `${PUBLIC_URL}/auth/callback` })
+      body: JSON.stringify({ code, redirect_uri: `${PUBLIC_URL}/auth/callback` }),
+      signal: AbortSignal.timeout(5000)
     });
     if (!tokenRes.ok) return res.redirect('/auth/login');
     const tokenData = await tokenRes.json();
