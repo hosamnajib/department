@@ -1,4 +1,4 @@
-﻿# Making a Rizurf microapp fast and reliable
+# Making a Rizurf microapp fast and reliable
 
 For the team, or the coding agent, working on **one microapp** connected to
 the Rizurf API Gateway. Work through it top to bottom: the sections are in
@@ -9,7 +9,7 @@ This document adds to two others and never overrides them:
 
 - **`RIZURF_API_TEMPLATE.md`**: the service contract (`/health`,
   `/openapi.json`, error shape).
-- **`MICROAPP_AUTH.md`**: sign-in through the gateway. In particular, **┬º5
+- **`MICROAPP_AUTH.md`**: sign-in through the gateway. In particular, **§5
   (check the gateway on every request, no cache) still applies.** Nothing
   below caches a session check. Section 5 here makes that check cheaper
   without skipping it.
@@ -50,13 +50,13 @@ fix was section 1.
 **The problem.** On Vercel, serverless functions default to **Washington
 D.C. (`iad1`)**. If your database is anywhere else (Singapore, Tokyo, Kuala
 Lumpur, a Supabase project in `ap-southeast-1`), **every query crosses an
-ocean**, at 150ΓÇô300 ms each. A page that runs 6 queries one after another
-spends 1ΓÇô2 seconds just waiting on the network. No code optimisation can
+ocean**, at 150–300 ms each. A page that runs 6 queries one after another
+spends 1–2 seconds just waiting on the network. No code optimisation can
 beat that; only moving the code can.
 
 The gateway itself now runs in **Singapore (`sin1`)**, and its database is in
 Kuala Lumpur. Every app also calls the gateway on each signed-in request
-(`/oauth/introspect`, MICROAPP_AUTH.md ┬º5), so an app in Southeast Asia is
+(`/oauth/introspect`, MICROAPP_AUTH.md §5), so an app in Southeast Asia is
 closest to both.
 
 **Check where your functions run.** Every Vercel response carries a header
@@ -69,7 +69,7 @@ curl -sI https://YOUR-APP.vercel.app/health | grep -i x-vercel-id
 
 The **second** part is where your code runs.
 
-**Find where your database is.** Supabase: Project Settings ΓåÆ General ΓåÆ
+**Find where your database is.** Supabase: Project Settings → General →
 Region. Neon, PlanetScale, Railway, Hostinger: see the dashboard or the
 hostname. Pick the Vercel region nearest to it:
 
@@ -90,7 +90,7 @@ hostname. Pick the Vercel region nearest to it:
 }
 ```
 
-ΓÜá∩╕Å **Put it where you run `vercel deploy` from.** If the Vercel project has a
+⚠️ **Put it where you run `vercel deploy` from.** If the Vercel project has a
 *Root Directory* set (e.g. the app lives in `web/`) and you deploy with the
 CLI from the repo root, the CLI reads `vercel.json` from the **repo root**,
 not the subfolder. The gateway lost a deploy to exactly this. Confirm with
@@ -185,7 +185,7 @@ app.get("/health", async (req, res) => {
 ```
 
 - **Cold starts.** The first `/health` after a quiet period is slowest (the
-  1ΓÇô1.7 s numbers above are mostly this). Keep the code that `/health`
+  1–1.7 s numbers above are mostly this). Keep the code that `/health`
   imports small. Don't pull your entire app into it, and create database
   clients lazily at the first query rather than at import time. Moving to
   the right region (section 1) also shortens every cold start's first query.
@@ -223,7 +223,7 @@ to produce it.
 
 ### 5a. Session check (`/oauth/introspect`): run it *alongside* your data, not *before* it
 
-MICROAPP_AUTH.md ┬º5 says to check on **every** signed-in request with **no
+MICROAPP_AUTH.md §5 says to check on **every** signed-in request with **no
 cache**. That stays. But you don't have to *wait* for the answer before you
 start loading the page's data:
 
@@ -293,11 +293,11 @@ delete that entry and retry once with a fresh token.
 
 This is safe: a token is only a proof that *this app* is allowed to call,
 and it expires on its own. It is **not** the same as caching a *person's*
-session check, which ┬º5a still does every time.
+session check, which §5a still does every time.
 
 ### 5c. JWKS: fetch once per process
 
-Already in MICROAPP_AUTH.md ┬º3: keep the gateway's public keys in memory and
+Already in MICROAPP_AUTH.md §3: keep the gateway's public keys in memory and
 re-fetch only when a token arrives with a `kid` you don't have. If your code
 fetches `/.well-known/jwks.json` per request, fix that first. It's a free
 round trip saved on every sign-in.
@@ -318,8 +318,8 @@ const g = globalThis;
 export const db = g.__db ??= createPool({ connectionString: process.env.DATABASE_URL, max: 3 });
 ```
 
-- **Keep the pool small** (2ΓÇô5). Every serverless instance has its own
-  pool, and many instances ├ù a big pool exhausts the database's connection
+- **Keep the pool small** (2–5). Every serverless instance has its own
+  pool, and many instances × a big pool exhausts the database's connection
   limit, which shows up as *random* failures under load.
 - **Supabase: use the pooled connection string** (Transaction mode, port
   **6543**), not the direct one (5432). The direct one has a low connection
@@ -329,7 +329,7 @@ export const db = g.__db ??= createPool({ connectionString: process.env.DATABASE
 
 ## 7. Make queries themselves cheaper
 
-Only after sections 1ΓÇô6, since those are bigger:
+Only after sections 1–6, since those are bigger:
 
 - **Index what you filter and sort by.** Any column in a `WHERE`, `JOIN`, or
   `ORDER BY` on a table with more than a few hundred rows. Check with
@@ -337,7 +337,7 @@ Only after sections 1ΓÇô6, since those are bigger:
   big table is the smell.
 - **Select only the columns you use.** `SELECT *` drags large text/JSON
   columns over the network for nothing.
-- **Paginate lists.** Return 20ΓÇô50 rows with a cursor or `limit`/`offset`,
+- **Paginate lists.** Return 20–50 rows with a cursor or `limit`/`offset`,
   never "everything", and document the parameters in `/openapi.json`.
 - **Count cheaply.** Don't load every row just to show a total.
 
@@ -365,7 +365,7 @@ const departments = await cached("departments", 60_000, () => db.query("SELECT i
 **Never cache:**
 - anything decided per person (their permissions, their records) across
   different people;
-- session / sign-in checks (MICROAPP_AUTH.md ┬º5);
+- session / sign-in checks (MICROAPP_AUTH.md §5);
 - anything where showing a stale value is wrong, not just old: balances,
   approvals, statuses someone is about to act on.
 
@@ -388,7 +388,7 @@ becomes a hung page.
   something unless it carries an idempotency key.
 - **Don't make people wait for side effects.** Logging, analytics,
   "last seen" updates and emails don't need to finish before the response.
-  In Next.js use `after(() => ΓÇª)` from `next/server`; on Vercel otherwise
+  In Next.js use `after(() => …)` from `next/server`; on Vercel otherwise
   use `waitUntil` from `@vercel/functions`. Do **not** just leave a promise
   un-awaited: serverless may freeze the process and the work silently never
   happens.
@@ -415,17 +415,17 @@ for i in 1 2 3; do curl -s -o /dev/null -w "openapi %{time_total}s\n" https://YO
 ```
 
 To find *which part* of a slow endpoint is slow, add a `Server-Timing`
-header. It shows up in the browser DevTools Network tab ΓåÆ Timing:
+header. It shows up in the browser DevTools Network tab → Timing:
 
 ```js
 const t0 = performance.now();
-const rows = await db.query(/* ΓÇª */);
+const rows = await db.query(/* … */);
 const t1 = performance.now();
 const body = render(rows);
 res.set("server-timing", `db;dur=${(t1 - t0).toFixed(0)}, render;dur=${(performance.now() - t1).toFixed(0)}`);
 ```
 
-A number that's roughly *(number of sequential queries ├ù 150ΓÇô300 ms)* means
+A number that's roughly *(number of sequential queries × 150–300 ms)* means
 you're in the wrong region (section 1) or awaiting in sequence (section 2).
 A single large number on one query means indexes (section 7).
 
